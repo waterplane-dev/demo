@@ -5,7 +5,7 @@
 // over Tailscale to a possibly-asleep host, could take seconds).
 //
 // Freshness comes from the build, NOT from network-first: SHELL is versioned per
-// build (7390fcb37b4cb431 is replaced at build time, see vite.config.ts). A new build
+// build (ca37a4cb74b3867d is replaced at build time, see vite.config.ts). A new build
 // → a new cache name → old caches purged on activate → a new SW that, on taking
 // control, reloads the page (see main.tsx). So within one build generation the
 // cached index.html and the hashed assets it references are always a consistent
@@ -21,7 +21,66 @@ const BRAND_NAME = "waterplane";
 /** Every older brand's slug, newest first — only so its pulls cache survives
  *  the purge until the page has copied it (web/src/boot/brandMigrate.ts). */
 const LEGACY_SLUGS = "usmc".split(",").filter(Boolean);
-const SHELL = `${BRAND_SLUG}-shell-7390fcb37b4cb431`;
+const SHELL = `${BRAND_SLUG}-shell-ca37a4cb74b3867d`;
+/** The page's IndexedDB name in a browser (`dbNameFor(null)`), where the relay store lives. */
+const BRAND_CACHE = "waterplane-cache";
+
+// The background relay (`swRelay.js`, PLAN bg-link-send WP8): queued prompts the page would
+// send unasked, carried over `fetch` while no page can. Versioned by the build so a new relay
+// arrives with the worker that loads it. Guarded: a context without `importScripts` (a node
+// test running this file) simply has no relay, and every handler below behaves as before.
+if (typeof importScripts === "function") {
+  try { importScripts("/swRelay.js?v=ca37a4cb74b3867d"); } catch { /* no relay this build */ }
+}
+const relay = () => (typeof WPRelay === "object" && WPRelay ? WPRelay : null);
+/** Actions are drawn on Android (Chromium) only; iOS shows none and says so with maxActions 0. */
+const canAct = () => {
+  try { return (self.Notification?.maxActions ?? 0) > 0 && !/iPhone|iPad|iPod/.test(self.navigator?.userAgent || ""); } catch { return false; }
+};
+function relayEnv(R) {
+  return {
+    store: R.idbStore(BRAND_CACHE),
+    fetch: (u, i) => fetch(u, i),
+    now: () => Date.now(),
+    pageVisible: async () => (await self.clients.matchAll({ type: "window", includeUncontrolled: true })).some((w) => w.visibilityState === "visible"),
+  };
+}
+/** One wake, then the notification it ends in (`push` given ⇒ always one: iOS requires it). */
+async function relayWake(push) {
+  const R = relay();
+  if (!R) return null;
+  const rep = await R.runRelay(relayEnv(R)).catch(() => null);
+  if (rep && rep.more && self.registration.sync) self.registration.sync.register("queue").catch(() => {});
+  const n = rep ? R.notice(rep, push, BRAND_NAME, canAct()) : null;
+  const quietPush = !!push && R.quietPush(rep);
+  if (n) {
+    await self.registration.showNotification(n.title, {
+      body: n.body,
+      tag: (push && push.tag) || "relay",
+      renotify: false,
+      icon: "/assets/icon-192.png",
+      badge: "/assets/icon-192.png",
+      actions: n.actions,
+      data: { relayRelease: n.release, item: push ? notifItem(push) : null },
+      // A push to a phone whose plan was read and is EMPTY (depth 0; unknown or unreadable stays loud) still has
+      // to show one (iOS, Chrome) but quietly — no buzz, not sticky. Every paired phone gets
+      // `link.back`; only a phone with a queue should be bothered.
+      requireInteraction: (!!push || n.release.length > 0) && !quietPush,
+      ...(quietPush ? { silent: true } : {}),
+    });
+  }
+  return { rep, shown: !!n };
+}
+
+// Background Sync (Chromium; iOS has none): the page registers "queue" when its plan is not
+// empty and the link is down, or as it freezes. Rejecting asks the browser to try again later
+// — only for a reason that can pass (no network, the page not yet frozen).
+self.addEventListener("sync", (event) => {
+  if (event.tag !== "queue" || !relay()) return;
+  event.waitUntil(relayWake(null).then((r) => {
+    if (r?.rep?.transient && !r.rep.sent) throw new Error("relay: try again later");
+  }));
+});
 
 // Image thumbnails, cached across builds. The name is deliberately NOT
 // build-hashed: a deploy changes the app bundle, not the pictures, and wiping
@@ -51,6 +110,16 @@ const THUMBS = `${BRAND_SLUG}-thumbs-v1`;
 const PULLS = `${BRAND_SLUG}-pulls-v1`;
 /** The same cache under an older name: kept by the purge for the page to copy. */
 const LEGACY_PULLS = LEGACY_SLUGS.map((s) => `${s}-pulls-v1`);
+
+// An extension's downloaded assets (the OCR engine and its language data: megabytes,
+// fetched once from the person's own host when the extension was switched ON).
+// One Cache per extension, `wp-ext-<id>`, filled by the EXTENSION with authenticated
+// fetches of `/api/plugin/<id>/asset/<file>` stored under `/ext-asset/<id>/<file>`
+// (sdk/extAssets.ts names both; its test reads this file). Not build-scoped, so the
+// activate purge spares the prefix: a UI deploy must not re-download 7 MB. Served
+// CACHE-ONLY below — never the network, which has no such route.
+const EXT_CACHE_PREFIX = "wp-ext-";
+const EXT_ROUTE = /^\/ext-asset\/([a-z0-9][a-z0-9-]*)\/([A-Za-z0-9][A-Za-z0-9._-]*)$/;
 /** Cap on cached thumbnails, evicted oldest-insertion-first (cache.keys() is
  *  insertion-ordered). ~400 × ~30 KB ≈ 12 MB, well inside a phone's quota. */
 const THUMB_MAX = 400;
@@ -78,10 +147,18 @@ self.addEventListener("install", (e) => {
 // build (vite.config.ts `demoPrecache`). The demo makes no request off the
 // device, so what its gallery shows must already be here. One failed file
 // costs that picture, never the install.
-const DEMO_PRECACHE = ["/demo/media/r1/.claude/inbox/swipe-sketch.png","/demo/media/r1/.claude/outbox/todo-garden-before.png","/demo/media/r1/.claude/outbox/todo-garden-bigger-add.png","/demo/media/r1/.claude/outbox/todo-garden-date-picker.png","/demo/media/r1/.claude/outbox/todo-garden-empty-state.png","/demo/media/r1/.claude/outbox/todo-garden-grouped.png","/demo/media/r1/.claude/outbox/todo-garden-preview.html","/demo/media/r1/.claude/outbox/todo-garden-quick-add.png","/demo/media/r1/.claude/outbox/todo-garden-release-notes.md","/demo/media/r1/.claude/outbox/todo-garden-sorted.png","/demo/media/r3/.claude/outbox/trail-log-ridge-loop.png"];
+const DEMO_PRECACHE = ["/demo/media/r1/dot-claude/inbox/swipe-sketch.png","/demo/media/r1/dot-claude/outbox/todo-garden-android-fixed.png","/demo/media/r1/dot-claude/outbox/todo-garden-android.png","/demo/media/r1/dot-claude/outbox/todo-garden-before.png","/demo/media/r1/dot-claude/outbox/todo-garden-date-picker.png","/demo/media/r1/dot-claude/outbox/todo-garden-empty-state.png","/demo/media/r1/dot-claude/outbox/todo-garden-grouped.png","/demo/media/r1/dot-claude/outbox/todo-garden-ios.png","/demo/media/r1/dot-claude/outbox/todo-garden-preview.html","/demo/media/r1/dot-claude/outbox/todo-garden-release-notes.md","/demo/media/r1/dot-claude/outbox/todo-garden-sorted.png","/demo/media/r3/dot-claude/outbox/trail-log-ridge-loop.png"];
 function precacheDemo(c) {
   const urls = Array.isArray(DEMO_PRECACHE) ? DEMO_PRECACHE : [];
   return Promise.all(urls.map((u) => c.add(u).catch(() => {})));
+}
+
+/** `/ext-asset/<id>/<file>` from Cache `wp-ext-<id>`, or 404. `caches.has` first:
+ *  `caches.open` would CREATE an empty cache for an extension that never downloaded. */
+async function extAsset(id, path) {
+  const name = EXT_CACHE_PREFIX + id;
+  const hit = (await caches.has(name)) ? await (await caches.open(name)).match(path, { ignoreSearch: true }) : undefined;
+  return hit ?? new Response(`${id}: ${path.split("/").pop()} is not downloaded on this phone`, { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } });
 }
 
 self.addEventListener("activate", (e) => {
@@ -91,7 +168,7 @@ self.addEventListener("activate", (e) => {
       // exempt BY NAME: it is not build-scoped, and a plain `n !== SHELL` filter
       // would silently wipe it on every single deploy.
       const names = await caches.keys();
-      await Promise.all(names.filter((n) => n !== SHELL && n !== THUMBS && n !== PULLS && !LEGACY_PULLS.includes(n)).map((n) => caches.delete(n)));
+      await Promise.all(names.filter((n) => n !== SHELL && n !== THUMBS && n !== PULLS && !LEGACY_PULLS.includes(n) && !n.startsWith(EXT_CACHE_PREFIX)).map((n) => caches.delete(n)));
       await self.clients.claim();
     })(),
   );
@@ -99,7 +176,7 @@ self.addEventListener("activate", (e) => {
 
 // Push: show the notification the host sent.
 self.addEventListener("push", (event) => {
-  let data = { title: BRAND_NAME, body: "", sessionId: undefined, tag: undefined, image: undefined, file: undefined, pull: undefined };
+  let data = { title: BRAND_NAME, body: "", sessionId: undefined, plugin: undefined, tag: undefined, image: undefined, file: undefined, pull: undefined };
   try { data = { ...data, ...event.data.json() }; } catch { /* plain text */ }
   // Auto-download: a `pull` id means the host queued this file for the phone to
   // fetch on its own. Start it HERE, in the push handler, because that is the
@@ -107,24 +184,62 @@ self.addEventListener("push", (event) => {
   // agent finishes a build. Best-effort: no Background Fetch support (iOS, or a
   // non-secure context) just leaves the item queued for the in-page fallback.
   if (data.pull && data.file) event.waitUntil(startPull(data.pull, data.file).catch(() => {}));
-  event.waitUntil(
+  // The desktop is reachable again (host `linkback.ts`): run the relay, then show ONE
+  // notification saying what was sent and what waits — or the push's own words. iOS
+  // requires every push to show one, so a failed relay still falls through to the plain one.
+  if (data.kind === "link.back" && relay()) {
+    // The quiet case (nothing queued here) is decided inside `relayWake`, where the report is. A relay
+    // that failed or threw says nothing about the queue, so that phone gets the plain, loud one.
+    const plain = () => showPlain(data);
+    event.waitUntil(relayWake(data).then((r) => (r && r.shown ? null : plain())).catch(plain));
+    return;
+  }
+  event.waitUntil(showPlain(data));
+});
+
+function showPlain(data) {
+  return (
     self.registration.showNotification(data.title, {
       body: data.body,
       tag: data.tag,
+      // Same tag replaces the earlier one in place and stays quiet (no second buzz): one notification per scope.
+      renotify: false,
       icon: "/assets/icon-192.png",
       badge: "/assets/icon-192.png",
-      data: { sessionId: data.sessionId, image: data.image, file: data.file },
+      data: { sessionId: data.sessionId, plugin: data.plugin, image: data.image, file: data.file, item: notifItem(data) },
       requireInteraction: true,
-    }),
+    })
   );
-});
+}
+
+// The feed item a push stands for, for a tap with no session, file, image or
+// plugin to open: the page's `openNotif` lands it (a health move opens its repo's
+// chart; a failed push the git view ON that failure; anything else its own row in
+// the feed). The host's payload IS the item plus `pull` (`server/clients.ts`), so it
+// is forwarded WHOLE, as the APK does — a field picked by hand here once dropped
+// `key` and `branch` (review A3c M2). Null on an older host's push.
+function notifItem(d) {
+  if (typeof d.id !== "string" || typeof d.kind !== "string") return null;
+  const { pull: _pull, ...item } = d;
+  return item;
+}
 
 // Tapping a notification focuses the app and asks it to open that session.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
+  // "Send N" on a relay notification (Android): release exactly the rows it named, if they are
+  // still in the plan as the same frames, and run the relay. No window opens.
+  if (event.action === "relay-send" && relay()) {
+    const R = relay();
+    const wanted = event.notification.data?.relayRelease || [];
+    event.waitUntil(R.release(relayEnv(R), wanted).then(() => relayWake(null)).catch(() => {}));
+    return;
+  }
   const sessionId = event.notification.data?.sessionId;
   const image = event.notification.data?.image;
   const file = event.notification.data?.file;
+  const plugin = event.notification.data?.plugin;
+  const item = event.notification.data?.item;
   // An artifact notification used to navigate straight to `…&download=1`, which
   // is the browser's own download: no resume, no row in the app, and nothing at
   // all in the Android shell. It goes through the app's ONE download path now
@@ -137,12 +252,16 @@ self.addEventListener("notificationclick", (event) => {
         if (file) w.postMessage({ type: "download-file", file });
         else if (image) w.postMessage({ type: "open-image", sessionId, image });
         else if (sessionId) w.postMessage({ type: "open-session", sessionId });
+        else if (plugin) w.postMessage({ type: "open-plugin", plugin });
+        else if (item) w.postMessage({ type: "open-notif", item });
         return;
       }
       // Cold start (no open window): encode the target in the hash so the app
       // restores it on boot — same scheme App.tsx parses for reload routing.
       const p = new URLSearchParams();
       if (sessionId) p.set("a", sessionId);
+      if (plugin && !sessionId) p.set("plugin", plugin);
+      if (item && !sessionId && !plugin && !image && !file) p.set("notif", JSON.stringify(item));
       if (image) { p.set("imgRepo", image.repoId); p.set("imgPath", image.relPath); }
       if (file) {
         p.set("dlRepo", file.repoId);
@@ -172,6 +291,13 @@ self.addEventListener("fetch", (event) => {
   //    network-first — the stored copy answers only when the network can't.
   if (THUMB_ROUTE.test(url.pathname) && url.searchParams.has("thumb") && !url.searchParams.has("download")) {
     event.respondWith(url.searchParams.has("v") ? thumbFirst(event.request) : thumbNetworkFirst(event.request));
+    return;
+  }
+  // An extension's own asset: cache-only (see EXT_CACHE_PREFIX). Absent ⇒ a plain 404,
+  // never a fall-through to the shell (which would answer index.html as "the wasm").
+  const ext = EXT_ROUTE.exec(url.pathname);
+  if (ext) {
+    event.respondWith(extAsset(ext[1], url.pathname));
     return;
   }
   // Never intercept the rest of the API, or the websocket upgrade.
