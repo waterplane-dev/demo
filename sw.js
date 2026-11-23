@@ -5,7 +5,7 @@
 // over Tailscale to a possibly-asleep host, could take seconds).
 //
 // Freshness comes from the build, NOT from network-first: SHELL is versioned per
-// build (4c255b7060950a98 is replaced at build time, see vite.config.ts). A new build
+// build (6fe99ee3a26fb810 is replaced at build time, see vite.config.ts). A new build
 // → a new cache name → old caches purged on activate → a new SW that, on taking
 // control, reloads the page (see main.tsx). So within one build generation the
 // cached index.html and the hashed assets it references are always a consistent
@@ -21,7 +21,7 @@ const BRAND_NAME = "waterplane";
 /** Every older brand's slug, newest first — only so its pulls cache survives
  *  the purge until the page has copied it (web/src/boot/brandMigrate.ts). */
 const LEGACY_SLUGS = "usmc".split(",").filter(Boolean);
-const SHELL = `${BRAND_SLUG}-shell-4c255b7060950a98`;
+const SHELL = `${BRAND_SLUG}-shell-6fe99ee3a26fb810`;
 /** The page's IndexedDB name in a browser (`dbNameFor(null)`), where the relay store lives. */
 const BRAND_CACHE = "waterplane-cache";
 
@@ -30,7 +30,7 @@ const BRAND_CACHE = "waterplane-cache";
 // arrives with the worker that loads it. Guarded: a context without `importScripts` (a node
 // test running this file) simply has no relay, and every handler below behaves as before.
 if (typeof importScripts === "function") {
-  try { importScripts("/swRelay.js?v=4c255b7060950a98"); } catch { /* no relay this build */ }
+  try { importScripts("/swRelay.js?v=6fe99ee3a26fb810"); } catch { /* no relay this build */ }
 }
 const relay = () => (typeof WPRelay === "object" && WPRelay ? WPRelay : null);
 /** Actions are drawn on Android (Chromium) only; iOS shows none and says so with maxActions 0. */
